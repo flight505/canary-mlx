@@ -18,68 +18,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-
-class FastConformerEncoder(nn.Module):
-    """
-    Simplified FastConformer encoder for audio processing.
-
-    NOTE: For production use, consider using the full implementation from:
-    https://github.com/senstella/parakeet-mlx
-
-    This is a placeholder that defines the expected interface.
-    A complete FastConformer implementation is ~500+ lines.
-    """
-
-    def __init__(self, config: dict):
-        super().__init__()
-        enc_cfg = config.get("encoder", {})
-
-        self.d_model = enc_cfg.get("d_model", 1024)
-        self.n_layers = enc_cfg.get("n_layers", 17)
-        self.n_heads = enc_cfg.get("n_heads", 8)
-        self.subsampling_factor = enc_cfg.get("subsampling_factor", 8)
-
-        # Pre-encoding: Mel features (80) -> model dimension
-        # Real FastConformer uses complex subsampling with strided convolutions
-        self.pre_encode = nn.Sequential(
-            nn.Conv1d(80, self.d_model, kernel_size=5, stride=2, padding=2),
-            nn.GELU(),
-            nn.Conv1d(self.d_model, self.d_model, kernel_size=5, stride=2, padding=2),
-            nn.GELU(),
-            nn.Conv1d(self.d_model, self.d_model, kernel_size=5, stride=2, padding=2),
-        )
-
-        # Conformer blocks (simplified)
-        # Real implementation needs: self-attention, convolution, feed-forward
-        self.layers = [
-            nn.TransformerEncoderLayer(
-                self.d_model,
-                self.n_heads,
-                norm_first=True
-            )
-            for _ in range(self.n_layers)
-        ]
-
-    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
-        """
-        Args:
-            x: Audio features [batch, time, mel_dim=80]
-            mask: Optional attention mask
-
-        Returns:
-            Encoded audio features [batch, time/8, d_model]
-        """
-        # Transpose for Conv1d: [batch, mel_dim, time]
-        x = mx.transpose(x, (0, 2, 1))
-        x = self.pre_encode(x)
-        # Back to [batch, time, d_model]
-        x = mx.transpose(x, (0, 2, 1))
-
-        # Apply transformer layers
-        for layer in self.layers:
-            x = layer(x, mask)
-
-        return x
+from conformer import FastConformerEncoder, create_conformer_from_config
 
 
 class ModalityAdapter(nn.Module):
@@ -126,7 +65,7 @@ class CanaryModel(nn.Module):
 
         # Build components
         print("Building encoder...")
-        self.encoder = FastConformerEncoder(self.config)
+        self.encoder = create_conformer_from_config(self.config)
 
         print("Building adapter...")
         self.adapter = ModalityAdapter(self.encoder_dim, self.llm_dim)
