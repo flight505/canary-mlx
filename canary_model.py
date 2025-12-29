@@ -27,7 +27,7 @@ class ModalityAdapter(nn.Module):
 
     def __init__(self, encoder_dim: int, llm_dim: int):
         super().__init__()
-        self.projection = nn.Linear(encoder_dim, llm_dim, bias=False)
+        self.projection = nn.Linear(encoder_dim, llm_dim, bias=True)
 
     def __call__(self, audio_features: mx.array) -> mx.array:
         """
@@ -60,9 +60,9 @@ class CanaryModel(nn.Module):
         enc_cfg = self.config.get("encoder", {})
         self.encoder_dim = enc_cfg.get("d_model", 1024)
 
-        # For Qwen3-1.7B, hidden_size is typically 1536
+        # For Qwen3-1.7B, hidden_size is 2048
         llm_cfg = self.config.get("llm", {})
-        self.llm_dim = llm_cfg.get("hidden_size", 1536)
+        self.llm_dim = llm_cfg.get("hidden_size", 2048)
 
         # Build components
         print("Building encoder...")
@@ -74,53 +74,89 @@ class CanaryModel(nn.Module):
         print("Building decoder...")
         self.decoder = create_qwen_decoder(self.config)
 
+        # Apply LoRA to decoder layers BEFORE loading weights
+        print("Preparing LoRA layers...")
+        self.decoder.apply_lora_to_layers()
+
         # Load weights
         print(f"Loading weights from {weights_path}...")
-        self.load_weights(weights_path)
+        self.load_weights_from_file(weights_path)
 
         # Audio locator tag (used in prompts)
         self.audio_locator_tag = self.config.get("audio_locator_tag", "<|audioplaceholder|>")
 
-    def load_weights(self, weights_path: str):
-        """Load converted MLX weights."""
+    def load_weights_from_file(self, weights_path: str):
+        """Load converted MLX weights from file."""
         weights = mx.load(weights_path)
         self.load_weights_dict(weights)
 
     def load_weights_dict(self, weights: dict):
-        """Load weights from dictionary with key mapping."""
-        # Map weight keys from NeMo format to our model structure
+        """
+        Load weights from dictionary with LoRA-aware key mapping.
+
+        Handles the complex NeMo structure including:
+        - base_layer.weight (frozen base weights)
+        - lora_A.default.weight (LoRA up-projection)
+        - lora_B.default.weight (LoRA down-projection)
+        """
         mapped_weights = {}
+        skipped = []
 
         for key, value in weights.items():
-            new_key = key
+            new_key = None
 
             # Map encoder weights: perception.encoder.* -> encoder.*
             if key.startswith("perception.encoder."):
                 new_key = key.replace("perception.encoder.", "encoder.")
 
             # Map projection/adapter: perception.proj.* -> adapter.projection.*
-            # Note: MLX adds "adapter." prefix automatically, so we only need "projection.*"
             elif key.startswith("perception.proj."):
                 new_key = "adapter." + key.replace("perception.proj.", "projection.")
 
-            # Map embedding: embed_tokens.* -> decoder.embed_tokens.*
+            # Map embedding: embed_tokens.* -> decoder.model.model.embed_tokens.*
             elif key.startswith("embed_tokens."):
-                new_key = "decoder." + key
+                new_key = "decoder.model.model." + key
 
-            # Map decoder weights: base_model.model.* -> decoder.model.*
-            elif key.startswith("base_model.model."):
-                new_key = key.replace("base_model.model.", "decoder.")
+            # Map decoder weights with LoRA handling
+            elif key.startswith("base_model.model.model."):
+                # Remove base_model.model prefix -> decoder.model.model.*
+                decoder_key = key.replace("base_model.model.model.", "")
 
-            # Skip unrecognized keys (log them for debugging)
-            elif not (key.startswith("encoder.") or key.startswith("adapter.") or key.startswith("decoder.")):
-                print(f"  Skipping unmapped key: {key}")
+                # Handle LoRA structure
+                if ".lora_A.default.weight" in key:
+                    # lora_A.default.weight -> lora_a
+                    new_key = "decoder.model.model." + decoder_key.replace(".lora_A.default.weight", ".lora_a")
+                elif ".lora_B.default.weight" in key:
+                    # lora_B.default.weight -> lora_b
+                    new_key = "decoder.model.model." + decoder_key.replace(".lora_B.default.weight", ".lora_b")
+                elif ".base_layer.weight" in key:
+                    # base_layer.weight -> linear.weight (LoRALinear stores base in .linear)
+                    new_key = "decoder.model.model." + decoder_key.replace(".base_layer.weight", ".linear.weight")
+                elif ".base_layer.bias" in key:
+                    # base_layer.bias -> linear.bias
+                    new_key = "decoder.model.model." + decoder_key.replace(".base_layer.bias", ".linear.bias")
+                else:
+                    # Regular weight (no LoRA)
+                    new_key = "decoder.model.model." + decoder_key
+
+            # Skip unrecognized keys
+            else:
+                skipped.append(key)
                 continue
 
-            mapped_weights[new_key] = value
+            if new_key:
+                mapped_weights[new_key] = value
 
-        # Update model with mapped weights
+        # Report skipped keys
+        if skipped:
+            print(f"  Skipped {len(skipped)} unmapped keys (first 5):")
+            for k in skipped[:5]:
+                print(f"    - {k}")
+
+        # Update model with mapped weights using load_weights (list of tuples)
+        # Use strict=False to allow missing bias parameters (Canary doesn't use bias for attention projections)
         print(f"Loading {len(mapped_weights)} weight tensors...")
-        self.update(mapped_weights)
+        self.load_weights(list(mapped_weights.items()), strict=False)
 
     def __call__(
         self,
@@ -142,7 +178,8 @@ class CanaryModel(nn.Module):
             logits: [batch, total_seq_len, vocab_size]
         """
         # 1. Encode audio -> [batch, audio_seq_len, encoder_dim]
-        audio_encoded = self.encoder(audio_features)
+        # parakeet Conformer returns (encoded, lengths)
+        audio_encoded, _ = self.encoder(audio_features, lengths=None)
 
         # 2. Project to LLM space -> [batch, audio_seq_len, llm_dim]
         audio_projected = self.adapter(audio_encoded)

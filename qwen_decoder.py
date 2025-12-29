@@ -1,69 +1,42 @@
 """
 Qwen3 decoder integration for Canary-MLX with LoRA support.
 
+Uses mlx_lm's built-in LoRA infrastructure for proper weight handling.
 Integrates mlx_lm's Qwen2 implementation with LoRA adapters for
 the Canary-Qwen speech-to-text model.
 """
 
-from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.qwen2 import Model as Qwen2Model
 from mlx_lm.models.qwen2 import ModelArgs as Qwen2ModelArgs
+from mlx_lm.tuner.lora import LoRALinear
+from mlx_lm.tuner.utils import linear_to_lora_layers
 
 
-class LoRALinear(nn.Module):
+def add_qk_norm_to_qwen(model: Qwen2Model, head_dim: int = 128, num_layers: int = 28):
     """
-    Linear layer with LoRA (Low-Rank Adaptation).
+    Add QK-normalization to Qwen2 model (Qwen3 feature).
 
-    Implements: output = (W + B @ A) @ input
-    Where:
-    - W: frozen base weights
-    - A: up-projection (r x d_in)
-    - B: down-projection (d_out x r)
-    - r: rank (typically 128 for Canary)
+    Args:
+        model: Qwen2Model instance
+        head_dim: Dimension per attention head (default: 128 for Qwen3-1.7B)
+        num_layers: Number of layers to add QK-norm to (default: 28, layers 0-27)
     """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        rank: int = 128,
-        alpha: int = 256,
-        bias: bool = False
-    ):
-        super().__init__()
-
-        # Base linear layer (frozen during inference)
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-
-        # LoRA parameters
-        self.lora_a = mx.zeros((rank, in_features))
-        self.lora_b = mx.zeros((out_features, rank))
-
-        # Scaling factor
-        self.scaling = alpha / rank
-
-        self.rank = rank
-
-    def __call__(self, x: mx.array) -> mx.array:
-        # Base transformation
-        result = self.linear(x)
-
-        # Add LoRA adaptation: (x @ A.T @ B.T) * scaling
-        lora_out = (x @ self.lora_a.T) @ self.lora_b.T
-        result = result + lora_out * self.scaling
-
-        return result
+    for i in range(num_layers):
+        layer = model.model.layers[i]
+        # Add RMSNorm for Q and K projections
+        layer.self_attn.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        layer.self_attn.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
 
 
 class Qwen3Decoder(nn.Module):
     """
     Qwen3-1.7B decoder with LoRA adapters for Canary-Qwen.
 
-    This wraps mlx_lm's Qwen2Model and adds LoRA adapter support
+    Uses mlx_lm's LoRA infrastructure to properly handle LoRA weights
     for q_proj and v_proj layers as used in Canary training.
     """
 
@@ -74,11 +47,11 @@ class Qwen3Decoder(nn.Module):
         self.config = config
 
         # Build Qwen2 model args
-        # For Canary-Qwen, the decoder is Qwen3-1.7B
+        # For Canary-Qwen: decoder has 28 layers with LoRA (NOT 32 - that was confused with encoder)
         self.model_args = Qwen2ModelArgs(
             model_type="qwen2",
             hidden_size=2048,  # Qwen3-1.7B dimension
-            num_hidden_layers=28,
+            num_hidden_layers=28,  # Canary decoder has 28 layers
             intermediate_size=6144,
             num_attention_heads=16,
             num_key_value_heads=16,
@@ -87,23 +60,68 @@ class Qwen3Decoder(nn.Module):
             rope_traditional=False,
             rope_scaling=None,
             rms_norm_eps=1e-6,
-            tie_word_embeddings=False
+            tie_word_embeddings=True  # lm_head shares weights with embed_tokens
         )
 
-        # Build base model
+        # Build base model (already includes embed_tokens)
         self.model = Qwen2Model(self.model_args)
+
+        # Add QK-normalization (Qwen3 feature)
+        # Head dim = hidden_size / num_heads = 2048 / 16 = 128
+        head_dim = self.model_args.hidden_size // self.model_args.num_attention_heads
+        add_qk_norm_to_qwen(self.model, head_dim=head_dim)
 
         # LoRA configuration
         lora_cfg = config.get("lora", {})
         self.lora_rank = lora_cfg.get("r", 128)
         self.lora_alpha = lora_cfg.get("lora_alpha", 256)
-        self.lora_targets = lora_cfg.get("target_modules", ["q_proj", "v_proj"])
+        self.lora_scale = self.lora_alpha / self.lora_rank
+        self.lora_dropout = lora_cfg.get("lora_dropout", 0.01)
 
-        # Embedding layer for text tokens
-        self.embed_tokens = nn.Embedding(
-            self.model_args.vocab_size,
-            self.model_args.hidden_size
-        )
+        # Flag to track if LoRA has been applied
+        self._lora_applied = False
+
+    @property
+    def layers(self):
+        """Expose layers property for LoRA conversion."""
+        return self.model.layers
+
+    def apply_lora_to_layers(self):
+        """
+        Convert q_proj and v_proj layers to LoRA-enabled versions.
+
+        This applies LoRA to layers 0-27 (28 layers total) where LoRA
+        weights exist in the Canary model.
+        """
+        if self._lora_applied:
+            return
+
+        print("Converting layers to LoRA...")
+
+        # Manually convert q_proj and v_proj in layers 0-27
+        for layer_idx in range(28):  # Layers 0-27 have LoRA
+            layer = self.model.layers[layer_idx]
+
+            # Convert q_proj to LoRA
+            q_proj = layer.self_attn.q_proj
+            layer.self_attn.q_proj = LoRALinear.from_base(
+                q_proj,
+                r=self.lora_rank,
+                dropout=self.lora_dropout,
+                scale=self.lora_scale
+            )
+
+            # Convert v_proj to LoRA
+            v_proj = layer.self_attn.v_proj
+            layer.self_attn.v_proj = LoRALinear.from_base(
+                v_proj,
+                r=self.lora_rank,
+                dropout=self.lora_dropout,
+                scale=self.lora_scale
+            )
+
+        self._lora_applied = True
+        print(f"Applied LoRA (rank={self.lora_rank}, scale={self.lora_scale}) to 28 layers")
 
     def __call__(
         self,
@@ -126,7 +144,7 @@ class Qwen3Decoder(nn.Module):
 
     def get_text_embeddings(self, input_ids: mx.array) -> mx.array:
         """Get embeddings for text token IDs."""
-        return self.embed_tokens(input_ids)
+        return self.model.model.embed_tokens(input_ids)
 
 
 def create_qwen_decoder(config: dict) -> Qwen3Decoder:
