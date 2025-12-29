@@ -88,9 +88,39 @@ class CanaryModel(nn.Module):
 
     def load_weights_dict(self, weights: dict):
         """Load weights from dictionary with key mapping."""
-        # Create a mapping of our module structure to weight keys
-        # This may require custom logic depending on exact key names
-        self.update(weights)
+        # Map weight keys from NeMo format to our model structure
+        mapped_weights = {}
+
+        for key, value in weights.items():
+            new_key = key
+
+            # Map encoder weights: perception.encoder.* -> encoder.*
+            if key.startswith("perception.encoder."):
+                new_key = key.replace("perception.encoder.", "encoder.")
+
+            # Map projection/adapter: perception.proj.* -> adapter.projection.*
+            # Note: MLX adds "adapter." prefix automatically, so we only need "projection.*"
+            elif key.startswith("perception.proj."):
+                new_key = "adapter." + key.replace("perception.proj.", "projection.")
+
+            # Map embedding: embed_tokens.* -> decoder.embed_tokens.*
+            elif key.startswith("embed_tokens."):
+                new_key = "decoder." + key
+
+            # Map decoder weights: base_model.model.* -> decoder.model.*
+            elif key.startswith("base_model.model."):
+                new_key = key.replace("base_model.model.", "decoder.")
+
+            # Skip unrecognized keys (log them for debugging)
+            elif not (key.startswith("encoder.") or key.startswith("adapter.") or key.startswith("decoder.")):
+                print(f"  Skipping unmapped key: {key}")
+                continue
+
+            mapped_weights[new_key] = value
+
+        # Update model with mapped weights
+        print(f"Loading {len(mapped_weights)} weight tensors...")
+        self.update(mapped_weights)
 
     def __call__(
         self,

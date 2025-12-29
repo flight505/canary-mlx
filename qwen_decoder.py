@@ -85,7 +85,9 @@ class Qwen3Decoder(nn.Module):
             vocab_size=151936,
             rope_theta=1000000.0,
             rope_traditional=False,
-            rope_scaling=None
+            rope_scaling=None,
+            rms_norm_eps=1e-6,
+            tie_word_embeddings=False
         )
 
         # Build base model
