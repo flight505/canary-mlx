@@ -63,7 +63,7 @@ def extract_mel_features(
     n_fft: int = 512,
     win_length: int = 400,
     hop_length: int = 160,
-    n_mels: int = 80
+    n_mels: int = 128  # Canary uses 128 mel bins, not 80
 ) -> mx.array:
     """
     Extract log-mel spectrogram features.
@@ -73,7 +73,7 @@ def extract_mel_features(
     - FFT size: 512
     - Window: 25ms (400 samples @ 16kHz)
     - Hop: 10ms (160 samples @ 16kHz)
-    - Mel bins: 80
+    - Mel bins: 128
 
     Args:
         waveform: Audio waveform [samples]

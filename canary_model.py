@@ -123,12 +123,17 @@ class CanaryModel(nn.Module):
                 decoder_key = key.replace("base_model.model.model.", "")
 
                 # Handle LoRA structure
+                # NeMo stores: lora_A as (rank, in_features), lora_B as (out_features, rank)
+                # mlx_lm expects: lora_a as (in_features, rank), lora_b as (rank, out_features)
+                # So we need to transpose both
                 if ".lora_A.default.weight" in key:
-                    # lora_A.default.weight -> lora_a
+                    # lora_A.default.weight -> lora_a (transposed)
                     new_key = "decoder.model.model." + decoder_key.replace(".lora_A.default.weight", ".lora_a")
+                    value = value.T  # Transpose (rank, in_features) -> (in_features, rank)
                 elif ".lora_B.default.weight" in key:
-                    # lora_B.default.weight -> lora_b
+                    # lora_B.default.weight -> lora_b (transposed)
                     new_key = "decoder.model.model." + decoder_key.replace(".lora_B.default.weight", ".lora_b")
+                    value = value.T  # Transpose (out_features, rank) -> (rank, out_features)
                 elif ".base_layer.weight" in key:
                     # base_layer.weight -> linear.weight (LoRALinear stores base in .linear)
                     new_key = "decoder.model.model." + decoder_key.replace(".base_layer.weight", ".linear.weight")
@@ -145,6 +150,16 @@ class CanaryModel(nn.Module):
                 continue
 
             if new_key:
+                # NeMo Decoder weights are stored as (in_features, out_features)
+                # MLX expects (out_features, in_features)
+                # Transpose decoder linear weights only (encoder/adapter are already in MLX format)
+                # (but not embeddings, norms, biases, or LoRA weights which are handled separately)
+                if (key.startswith("base_model.model.model.") and
+                    key.endswith(".weight") and
+                    len(value.shape) == 2 and
+                    not any(x in key for x in ["embed_tokens", "norm", "lora_"])):
+                    value = value.T
+
                 mapped_weights[new_key] = value
 
         # Report skipped keys

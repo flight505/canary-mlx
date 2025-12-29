@@ -54,7 +54,7 @@ class Qwen3Decoder(nn.Module):
             num_hidden_layers=28,  # Canary decoder has 28 layers
             intermediate_size=6144,
             num_attention_heads=16,
-            num_key_value_heads=16,
+            num_key_value_heads=8,  # GQA with 8 KV heads (not 16)
             vocab_size=151936,
             rope_theta=1000000.0,
             rope_traditional=False,
@@ -140,7 +140,10 @@ class Qwen3Decoder(nn.Module):
         Returns:
             logits: [batch, seq_len, vocab_size]
         """
-        return self.model(inputs_embeds=inputs_embeds, cache=cache)
+        # mlx_lm's Qwen2Model uses 'input_embeddings' parameter
+        # Pass dummy inputs array since we're providing embeddings directly
+        dummy_inputs = mx.zeros((inputs_embeds.shape[0], 1), dtype=mx.int32)
+        return self.model(dummy_inputs, cache=cache, input_embeddings=inputs_embeds)
 
     def get_text_embeddings(self, input_ids: mx.array) -> mx.array:
         """Get embeddings for text token IDs."""
