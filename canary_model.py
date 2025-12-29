@@ -19,6 +19,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from conformer import FastConformerEncoder, create_conformer_from_config
+from qwen_decoder import Qwen3Decoder, create_qwen_decoder
 
 
 class ModalityAdapter(nn.Module):
@@ -71,37 +72,14 @@ class CanaryModel(nn.Module):
         self.adapter = ModalityAdapter(self.encoder_dim, self.llm_dim)
 
         print("Building decoder...")
-        # For now, we use a placeholder. In practice, you'd load Qwen3-1.7B
-        # from mlx-community/Qwen3-1.7B-bf16 or similar
-        # This requires integrating with mlx_lm's Qwen implementation
-        self.decoder = self._build_decoder(llm_cfg)
+        self.decoder = create_qwen_decoder(self.config)
 
         # Load weights
         print(f"Loading weights from {weights_path}...")
         self.load_weights(weights_path)
 
         # Audio locator tag (used in prompts)
-        self.audio_locator_tag = "<|audioplaceholder|>"
-
-    def _build_decoder(self, llm_cfg: dict):
-        """
-        Build Qwen3 decoder.
-
-        TODO: Integrate with mlx_lm's Qwen implementation:
-        from mlx_lm.models.qwen2 import Model, ModelArgs
-
-        For now, this is a placeholder.
-        """
-        # Placeholder - in production, load actual Qwen3 model
-        class PlaceholderDecoder(nn.Module):
-            def __init__(self, hidden_size):
-                super().__init__()
-                self.hidden_size = hidden_size
-
-            def __call__(self, x):
-                return x
-
-        return PlaceholderDecoder(self.llm_dim)
+        self.audio_locator_tag = self.config.get("audio_locator_tag", "<|audioplaceholder|>")
 
     def load_weights(self, weights_path: str):
         """Load converted MLX weights."""
@@ -118,39 +96,38 @@ class CanaryModel(nn.Module):
         self,
         audio_features: mx.array,
         input_ids: mx.array,
-        attention_mask: Optional[mx.array] = None
+        attention_mask: Optional[mx.array] = None,
+        cache=None
     ) -> mx.array:
         """
         Forward pass combining audio and text.
 
         Args:
-            audio_features: [batch, audio_time, mel_dim=80]
+            audio_features: [batch, audio_time, mel_dim] - raw audio features
             input_ids: [batch, text_seq_len] - tokenized text
             attention_mask: Optional attention mask
+            cache: Optional KV cache for generation
 
         Returns:
             logits: [batch, total_seq_len, vocab_size]
         """
-        # 1. Encode audio
+        # 1. Encode audio -> [batch, audio_seq_len, encoder_dim]
         audio_encoded = self.encoder(audio_features)
 
-        # 2. Project to LLM space
+        # 2. Project to LLM space -> [batch, audio_seq_len, llm_dim]
         audio_projected = self.adapter(audio_encoded)
 
-        # 3. Get text embeddings (requires embedding layer from decoder)
-        # This is a simplified version - actual implementation needs
-        # proper integration with Qwen3's embedding layer
-        # text_embedded = self.decoder.embed_tokens(input_ids)
+        # 3. Get text embeddings -> [batch, text_seq_len, llm_dim]
+        text_embedded = self.decoder.get_text_embeddings(input_ids)
 
-        # 4. Concatenate audio and text along sequence dimension
+        # 4. Concatenate along sequence dimension
         # SALM architecture: [audio_features, text_features]
-        # combined = mx.concatenate([audio_projected, text_embedded], axis=1)
+        inputs_embeds = mx.concatenate([audio_projected, text_embedded], axis=1)
 
         # 5. Pass through decoder
-        # logits = self.decoder(combined, attention_mask)
+        logits = self.decoder(inputs_embeds, attention_mask, cache)
 
-        # Placeholder return
-        return audio_projected
+        return logits
 
 
 def load_model(model_dir: str) -> CanaryModel:
