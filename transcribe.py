@@ -137,6 +137,54 @@ def format_prompt(prompt_text: str, audio_locator: str) -> str:
     return f"{prompt_text} {audio_locator}"
 
 
+def greedy_generate(
+    model,
+    tokenizer,
+    audio_features: mx.array,
+    prompt_ids: mx.array,
+    max_tokens: int = 128,
+    eos_token_id: Optional[int] = None
+) -> mx.array:
+    """
+    Generate tokens using greedy decoding.
+
+    Args:
+        model: CanaryModel instance
+        tokenizer: Tokenizer
+        audio_features: Processed audio [1, time, mel_dim]
+        prompt_ids: Prompt token IDs [1, prompt_len]
+        max_tokens: Maximum tokens to generate
+        eos_token_id: End-of-sequence token ID
+
+    Returns:
+        Generated token IDs [1, generated_len]
+    """
+    # Start with prompt
+    generated_ids = prompt_ids
+
+    # Get EOS token if not provided
+    if eos_token_id is None:
+        eos_token_id = tokenizer.eos_token_id
+
+    for _ in range(max_tokens):
+        # Forward pass
+        logits = model(audio_features, generated_ids)
+
+        # Get next token (greedy - take argmax of last position)
+        next_token_logits = logits[:, -1, :]  # [1, vocab_size]
+        next_token = mx.argmax(next_token_logits, axis=-1, keepdims=True)  # [1, 1]
+
+        # Append to generated sequence
+        generated_ids = mx.concatenate([generated_ids, next_token], axis=1)
+
+        # Check for EOS
+        if int(next_token[0, 0]) == eos_token_id:
+            break
+
+    # Return only the newly generated tokens (exclude prompt)
+    return generated_ids[:, prompt_ids.shape[1]:]
+
+
 def transcribe(
     model,
     tokenizer,
@@ -170,28 +218,29 @@ def transcribe(
 
     print(f"  Feature shape: {audio_features.shape}")
 
-    # Format prompt
+    # Format prompt with audio locator tag
     full_prompt = format_prompt(prompt, model.audio_locator_tag)
     print(f"Prompt: {full_prompt}")
 
     # Tokenize prompt
-    tokens = tokenizer.encode(full_prompt, return_tensors="np")
-    input_ids = mx.array(tokens)
+    tokens = tokenizer.encode(full_prompt)
+    prompt_ids = mx.array([tokens])  # Add batch dim
 
-    print("Running inference...")
+    print(f"Generating (max {max_tokens} tokens)...")
 
-    # Simple forward pass (greedy decoding placeholder)
-    # In production, this would use mlx_lm.utils.generate() or similar
-    logits = model(audio_features, input_ids)
+    # Generate transcription
+    generated_ids = greedy_generate(
+        model,
+        tokenizer,
+        audio_features,
+        prompt_ids,
+        max_tokens=max_tokens
+    )
 
-    print(f"\nOutput shape: {logits.shape}")
+    # Decode generated tokens
+    transcription = tokenizer.decode(generated_ids[0].tolist())
 
-    # TODO: Implement proper generation loop
-    # For now, this is a placeholder that demonstrates the flow
-    print("\n⚠️  Generation loop not yet implemented")
-    print("This requires integration with mlx_lm's generation utilities")
-
-    return "[Transcription placeholder - model forward pass successful]"
+    return transcription
 
 
 def main():
