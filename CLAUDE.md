@@ -58,40 +58,6 @@ Base Qwen3-1.7B tokenizer extended with 267 Canary tokens:
 prompt = "<|en|><|transcribe|><|notimestamps|> Transcribe the following: <|audioplaceholder|>"
 ```
 
-## Current Debugging Status
-
-### ✅ Verified Working
-1. Weight conversion correctly transposes LoRA weights
-2. All 1,684 weights load successfully
-3. Base Qwen weights are identical to official Qwen3-1.7B (0.000000 difference)
-4. LoRA weights match original file after transposition (0.000000 difference)
-5. Embedding table (151,936 tokens) matches
-6. Model architecture matches specification
-7. Decoder uses mlx_lm's Model wrapper (includes lm_head for logits)
-8. Model correctly set to eval() mode (dropout disabled)
-
-### ❌ Known Issues
-1. **Model outputs gibberish** for both text-only and audio input
-2. LoRA causes large divergence even with correct weights:
-   - Layer 0 q_proj output differs by max=13.5 from base Qwen
-   - This is expected since LoRA was trained for audio+text pairs
-3. Text-only testing shows LoRA adaptations don't work without audio
-4. Audio testing still produces gibberish (audio preprocessing may be wrong)
-
-### Hypotheses
-1. **Most likely**: Audio feature extraction doesn't match NeMo exactly
-   - Need to verify actual mel-spectrogram values against NeMo output
-   - Subtle differences in preprocessing could break the model
-
-2. **Possible**: Audio-text embedding concatenation is incorrect
-   - Sequence order might matter
-   - Position embeddings might need adjustment
-   - Attention masks might be required
-
-3. **Unlikely**: Weight corruption (weights verified identical)
-
-See `DEBUGGING_LOG.md` for detailed investigation history.
-
 ## Development Commands
 
 ### Setup
@@ -187,4 +153,118 @@ python transcribe.py --model-dir mlx-canary --audio test_audio/macos_speech.wav
 2. **LoRA divergence is expected** - that's how LoRA works
 3. **Focus on audio preprocessing** - most likely issue
 4. **Don't test text-only** - LoRA won't work without audio
-5. **Refer to DEBUGGING_LOG.md** - full investigation history
+
+---
+
+# Debugging History
+
+## Current Issue
+
+**Model outputs gibberish** for both text-only and audio input, despite all weights being verified as correct.
+
+## Verified Correct ✅
+
+1. **Base Qwen weights**: Identical to official Qwen3-1.7B (0.000000 difference)
+2. **LoRA weights**: Match original file perfectly (0.000000 difference after transpose)
+3. **Embedding table**: 151,936 tokens, all rows match official Qwen
+4. **Architecture**: 28 layers, correct dimensions, GQA with 8 KV heads
+5. **Weight loading**: All 1,684 weights loaded successfully
+6. **Model structure**: Using mlx_lm's Model wrapper (includes lm_head logic)
+7. **Output format**: Decoder correctly returns logits, not hidden states
+
+## Issues Identified & Fixed ✅
+
+### 1. Weight Transposition Bugs (FIXED)
+- LoRA weights were correctly transposed in convert.py
+- Base linear weights were correctly NOT transposed
+- Verified: All weights match original with 0.000000 difference
+
+### 2. Missing Output Projection (INVESTIGATED)
+- Initially thought decoder was returning hidden states
+- Actually using mlx_lm's Model wrapper which includes lm_head
+- The import `from mlx_lm.models.qwen2 import Model as Qwen2Model` was confusing
+
+### 3. Dropout During Inference (FIXED)
+- Model was in training mode by default
+- Fixed by calling `model.eval()`
+- However, still produces gibberish even in eval mode
+
+## Weight Comparison Results
+
+```
+Decoder MLP down_proj:
+  Original shape: (2048, 6144)
+  Converted shape: (2048, 6144)
+  Max diff: 0.000000 ✓
+
+LoRA A (q_proj):
+  Original (NeMo): (128, 2048)
+  Loaded (MLX): (2048, 128)
+  Max diff after transpose: 0.000000 ✓
+
+LoRA B (q_proj):
+  Original (NeMo): (2048, 128)
+  Loaded (MLX): (128, 2048)
+  Max diff after transpose: 0.000000 ✓
+```
+
+## Forward Pass Analysis
+
+```
+Embeddings: IDENTICAL
+Layer 0 output: DIVERGES (max diff: 1.74)
+Final logits: VERY DIFFERENT (max diff: 18.7)
+
+With LoRA disabled (scale=0):
+  Layer 0 q_proj diff: 0.022 (small but non-zero due to computational precision)
+
+With LoRA enabled (scale=2.0):
+  Layer 0 q_proj diff: 13.5 (huge!)
+```
+
+## Current Theory
+
+### Most Likely: LoRA Incompatibility with Text-Only Input
+
+The LoRA weights were trained on audio+text pairs. When using text-only input:
+- The LoRA adaptations are designed to work WITH audio features
+- Without audio, the adaptations produce nonsensical outputs
+- This would explain why even with audio, transcription fails (audio preprocessing may be incorrect)
+
+### Areas to Investigate
+
+1. **Audio preprocessing**: Verify mel-spectrogram extraction matches NeMo exactly
+   - Preemphasis filter (0.97) ✓ Added
+   - Per-feature normalization ✓ Added
+   - Need to verify actual feature values match NeMo output
+
+2. **Audio-text concatenation**: Check how audio and text embeddings are combined
+   - Sequence ordering
+   - Position embeddings
+   - Attention masks
+
+3. **Prompt format**: Verify Canary control tokens are correct
+   - `<|en|><|transcribe|><|notimestamps|>` ✓ Added
+   - Token IDs match expected values
+
+## Code Fixes Applied
+
+### convert.py
+- Fixed LoRA weight transposition
+- Removed incorrect decoder weight transposition
+- Added proper handling for embeddings and adapter weights
+
+### qwen_decoder.py
+- Fixed GQA: num_key_value_heads=8 (was 16)
+- Changed from dummy zeros to None for input_ids when using embeddings
+- Added clarifying comments about Model wrapper
+
+### transcribe.py
+- Added preemphasis filter (0.97)
+- Changed to per-feature normalization
+- Fixed mel bins to 128
+- Added Canary control tokens to prompts
+
+### extend_tokenizer.py
+- Created script to extend Qwen3 tokenizer with 267 Canary tokens
+- Vocabulary: 151,669 → 151,936 tokens
