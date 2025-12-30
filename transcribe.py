@@ -2,7 +2,7 @@
 Inference script for Canary-Qwen speech recognition.
 
 Handles:
-- Audio preprocessing (16kHz, mono, log-mel spectrograms)
+- Audio preprocessing using parakeet-mlx (NeMo-compatible)
 - Prompt formatting with audio locator tags
 - Greedy decoding generation
 """
@@ -13,125 +13,68 @@ from typing import Optional
 
 import mlx.core as mx
 import numpy as np
-import soundfile as sf
-import torch
-import torchaudio
+from parakeet_mlx.audio import PreprocessArgs, get_logmel, load_audio
 from transformers import AutoTokenizer
 
 from canary_model import load_model
 
 
-def load_audio(file_path: str, target_sr: int = 16000) -> np.ndarray:
+def create_canary_preprocessor_config() -> PreprocessArgs:
     """
-    Load audio file and resample to target sample rate.
+    Create preprocessor configuration for Canary-Qwen model.
 
-    Args:
-        file_path: Path to audio file (.wav, .flac, etc.)
-        target_sr: Target sample rate (default: 16000 Hz)
+    Matches NeMo Canary preprocessing parameters using parakeet-mlx's
+    PreprocessArgs class.
 
-    Returns:
-        Audio waveform as numpy array, mono, at target sample rate
+    Note: hop_length and win_length are computed from window_stride and window_size:
+    - hop_length = int(window_stride * sample_rate) = 160 samples (10ms @ 16kHz)
+    - win_length = int(window_size * sample_rate) = 400 samples (25ms @ 16kHz)
     """
-    # Load with soundfile
-    waveform, sample_rate = sf.read(file_path)
-
-    # Convert to torch for resampling
-    waveform = torch.from_numpy(waveform).float()
-
-    # Handle stereo -> mono
-    if len(waveform.shape) > 1:
-        waveform = waveform.mean(dim=-1)
-
-    # Ensure 2D shape [1, samples] for torchaudio
-    if waveform.dim() == 1:
-        waveform = waveform.unsqueeze(0)
-
-    # Resample if needed
-    if sample_rate != target_sr:
-        resampler = torchaudio.transforms.Resample(
-            orig_freq=sample_rate,
-            new_freq=target_sr
-        )
-        waveform = resampler(waveform)
-
-    return waveform.squeeze(0).numpy()
+    return PreprocessArgs(
+        sample_rate=16000,
+        window_size=0.025,  # 25ms window (= 400 samples @ 16kHz)
+        window_stride=0.01,  # 10ms stride (= 160 samples @ 16kHz)
+        window="hann",  # Window function
+        features=128,  # Canary uses 128 mel bins (not default 80)
+        n_fft=512,
+        normalize="per_feature",  # Per mel-bin normalization
+        preemph=0.97,  # NeMo preemphasis
+        dither=1e-05,  # Dithering value
+        pad_to=0,  # No padding
+        pad_value=0.0,
+        mag_power=2.0,  # Power for magnitude calculation
+    )
 
 
 def extract_mel_features(
-    waveform: np.ndarray,
-    sample_rate: int = 16000,
-    n_fft: int = 512,
-    win_length: int = 400,
-    hop_length: int = 160,
-    n_mels: int = 128,  # Canary uses 128 mel bins, not 80
-    preemph: float = 0.97  # NeMo preemphasis coefficient
+    audio_path: str,
+    preprocessor_config: PreprocessArgs
 ) -> mx.array:
     """
-    Extract log-mel spectrogram features with NeMo-compatible preprocessing.
+    Extract log-mel spectrogram features using parakeet-mlx preprocessing.
 
-    NeMo Canary uses:
-    - Sample rate: 16kHz
-    - FFT size: 512
-    - Window: 25ms (400 samples @ 16kHz)
-    - Hop: 10ms (160 samples @ 16kHz)
-    - Mel bins: 128
-    - Preemphasis: 0.97 (CRITICAL for NeMo compatibility)
-    - Normalization: per_feature (per mel-bin)
+    This ensures NeMo-compatible preprocessing that matches what the
+    FastConformer encoder was trained with.
 
     Args:
-        waveform: Audio waveform [samples]
-        sample_rate: Sample rate (default: 16000)
-        n_fft: FFT size
-        win_length: Window length in samples
-        hop_length: Hop length in samples
-        n_mels: Number of mel filterbanks
-        preemph: Preemphasis coefficient (default: 0.97)
+        audio_path: Path to audio file
+        preprocessor_config: Preprocessor configuration
 
     Returns:
         Log-mel features [time, n_mels]
     """
-    # Convert to torch tensor
-    waveform = torch.from_numpy(waveform).float()
+    # Load audio using parakeet-mlx (handles resampling)
+    audio = load_audio(audio_path, preprocessor_config.sample_rate)
 
-    # Apply preemphasis filter (CRITICAL - matches NeMo preprocessing)
-    if preemph > 0:
-        # y[n] = x[n] - preemph * x[n-1]
-        waveform_preemph = torch.cat([
-            waveform[:1],  # Keep first sample
-            waveform[1:] - preemph * waveform[:-1]
-        ])
-        waveform = waveform_preemph
+    # Extract log-mel features using parakeet-mlx
+    # This applies NeMo-compatible preprocessing:
+    # - Preemphasis filter (0.97)
+    # - Mel spectrogram
+    # - Log compression
+    # - Normalization
+    mel = get_logmel(audio, preprocessor_config)
 
-    # Add channel dimension if needed
-    if waveform.dim() == 1:
-        waveform = waveform.unsqueeze(0)
-
-    # Mel spectrogram transform
-    mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sample_rate,
-        n_fft=n_fft,
-        win_length=win_length,
-        hop_length=hop_length,
-        n_mels=n_mels,
-        power=2.0
-    )
-
-    mel_spec = mel_transform(waveform)  # [1, n_mels, time]
-
-    # Log compression
-    log_mel = torch.log(mel_spec + 1e-5)
-
-    # Per-feature normalization (per mel-bin, matching NeMo "per_feature" mode)
-    # Shape: [1, n_mels, time]
-    mean = log_mel.mean(dim=2, keepdim=True)  # Mean across time, per mel-bin
-    std = log_mel.std(dim=2, keepdim=True)    # Std across time, per mel-bin
-    log_mel = (log_mel - mean) / (std + 1e-8)
-
-    # Transpose to [time, n_mels] and remove batch dim
-    log_mel = log_mel.squeeze(0).T  # [time, n_mels]
-
-    # Convert to MLX array
-    return mx.array(log_mel.numpy())
+    return mel
 
 
 def format_prompt(
@@ -222,7 +165,7 @@ def transcribe(
     max_tokens: int = 128
 ) -> str:
     """
-    Transcribe audio file.
+    Transcribe audio file using parakeet-mlx preprocessing.
 
     Args:
         model: CanaryModel instance
@@ -235,21 +178,30 @@ def transcribe(
         Transcribed text
     """
     print(f"Loading audio: {audio_path}")
-    waveform = load_audio(audio_path)
 
-    print(f"  Duration: {len(waveform) / 16000:.2f}s")
-    if len(waveform) / 16000 > 40:
-        print("  WARNING: Audio longer than 40s may produce degraded results")
+    # Create Canary preprocessor config
+    preprocessor_config = create_canary_preprocessor_config()
 
-    print("Extracting features...")
-    audio_features = extract_mel_features(waveform)
-    audio_features = mx.expand_dims(audio_features, 0)  # Add batch dim
+    # Load and preprocess audio using parakeet-mlx
+    audio_features = extract_mel_features(audio_path, preprocessor_config)
+
+    # parakeet's get_logmel returns shape [1, 1, time, n_mels]
+    # We need [1, time, n_mels] for the model
+    if audio_features.ndim == 4:
+        audio_features = audio_features.squeeze(1)  # Remove extra dimension
 
     print(f"  Feature shape: {audio_features.shape}")
+    print(f"  Using parakeet-mlx preprocessing (NeMo-compatible)")
+    print(f"    - Sample rate: {preprocessor_config.sample_rate} Hz")
+    print(f"    - Mel bins: {preprocessor_config.features}")
+    print(f"    - Preemphasis: {preprocessor_config.preemph}")
+    print(f"    - FFT size: {preprocessor_config.n_fft}")
+    print(f"    - Window: {int(preprocessor_config.window_size * preprocessor_config.sample_rate)} samples ({preprocessor_config.window_size*1000:.0f}ms)")
+    print(f"    - Hop: {int(preprocessor_config.window_stride * preprocessor_config.sample_rate)} samples ({preprocessor_config.window_stride*1000:.0f}ms)")
 
     # Format prompt with audio locator tag
     full_prompt = format_prompt(prompt, model.audio_locator_tag)
-    print(f"Prompt: {full_prompt}")
+    print(f"\nPrompt: {full_prompt}")
 
     # Tokenize prompt
     tokens = tokenizer.encode(full_prompt)
@@ -274,7 +226,7 @@ def transcribe(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transcribe audio using Canary-Qwen model"
+        description="Transcribe audio using Canary-Qwen model with parakeet-mlx preprocessing"
     )
     parser.add_argument(
         "--model-dir",

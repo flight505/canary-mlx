@@ -7,3 +7,4 @@ numpy>=1.24.0
 safetensors>=0.4.0
 huggingface-hub[cli]>=0.20.0
 soundfile>=0.12.0
+parakeet-mlx>=0.4.0
