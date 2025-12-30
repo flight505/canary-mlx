@@ -141,9 +141,10 @@ class Qwen3Decoder(nn.Module):
             logits: [batch, seq_len, vocab_size]
         """
         # mlx_lm's Qwen2Model uses 'input_embeddings' parameter
-        # Pass dummy inputs array since we're providing embeddings directly
-        dummy_inputs = mx.zeros((inputs_embeds.shape[0], 1), dtype=mx.int32)
-        return self.model(dummy_inputs, cache=cache, input_embeddings=inputs_embeds)
+        # Pass None as input_ids since we're providing embeddings directly
+        # Note: self.model is actually mlx_lm's Model wrapper (imported as Qwen2Model),
+        # which already includes the lm_head logic, so this returns logits, not hidden states
+        return self.model(None, cache=cache, input_embeddings=inputs_embeds)
 
     def get_text_embeddings(self, input_ids: mx.array) -> mx.array:
         """Get embeddings for text token IDs."""

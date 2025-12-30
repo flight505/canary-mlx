@@ -63,10 +63,11 @@ def extract_mel_features(
     n_fft: int = 512,
     win_length: int = 400,
     hop_length: int = 160,
-    n_mels: int = 128  # Canary uses 128 mel bins, not 80
+    n_mels: int = 128,  # Canary uses 128 mel bins, not 80
+    preemph: float = 0.97  # NeMo preemphasis coefficient
 ) -> mx.array:
     """
-    Extract log-mel spectrogram features.
+    Extract log-mel spectrogram features with NeMo-compatible preprocessing.
 
     NeMo Canary uses:
     - Sample rate: 16kHz
@@ -74,6 +75,8 @@ def extract_mel_features(
     - Window: 25ms (400 samples @ 16kHz)
     - Hop: 10ms (160 samples @ 16kHz)
     - Mel bins: 128
+    - Preemphasis: 0.97 (CRITICAL for NeMo compatibility)
+    - Normalization: per_feature (per mel-bin)
 
     Args:
         waveform: Audio waveform [samples]
@@ -82,12 +85,22 @@ def extract_mel_features(
         win_length: Window length in samples
         hop_length: Hop length in samples
         n_mels: Number of mel filterbanks
+        preemph: Preemphasis coefficient (default: 0.97)
 
     Returns:
         Log-mel features [time, n_mels]
     """
     # Convert to torch tensor
     waveform = torch.from_numpy(waveform).float()
+
+    # Apply preemphasis filter (CRITICAL - matches NeMo preprocessing)
+    if preemph > 0:
+        # y[n] = x[n] - preemph * x[n-1]
+        waveform_preemph = torch.cat([
+            waveform[:1],  # Keep first sample
+            waveform[1:] - preemph * waveform[:-1]
+        ])
+        waveform = waveform_preemph
 
     # Add channel dimension if needed
     if waveform.dim() == 1:
@@ -108,9 +121,10 @@ def extract_mel_features(
     # Log compression
     log_mel = torch.log(mel_spec + 1e-5)
 
-    # Normalize (per-utterance mean/std normalization)
-    mean = log_mel.mean()
-    std = log_mel.std()
+    # Per-feature normalization (per mel-bin, matching NeMo "per_feature" mode)
+    # Shape: [1, n_mels, time]
+    mean = log_mel.mean(dim=2, keepdim=True)  # Mean across time, per mel-bin
+    std = log_mel.std(dim=2, keepdim=True)    # Std across time, per mel-bin
     log_mel = (log_mel - mean) / (std + 1e-8)
 
     # Transpose to [time, n_mels] and remove batch dim
