@@ -53,13 +53,16 @@ def convert_canary(model_path: str, output_dir: str):
             stats["encoder"] += 1
 
         # --- ADAPTER/PROJECTION (Audio -> LLM) ---
-        elif "adapter" in key or "projection" in key or "modality_adapter" in key:
-            # Only transpose if it's a 2D weight matrix
-            if "weight" in key and val.ndim == 2:
-                val = val.T
-
+        elif "adapter" in key or "projection" in key or "modality_adapter" in key or ("perception" in key and "proj" in key):
+            # PyTorch and MLX use same convention (out, in) - no transpose needed
             mlx_state[key] = val.contiguous()
             stats["adapter"] += 1
+
+        # --- EMBEDDINGS ---
+        elif "embed_tokens" in key:
+            # Embedding weights don't need transposition
+            mlx_state[key] = val.contiguous()
+            stats["decoder"] += 1
 
         # --- DECODER (Qwen3-1.7B) ---
         elif "llm" in key or "decoder" in key:
@@ -67,13 +70,13 @@ def convert_canary(model_path: str, output_dir: str):
             new_key = key.replace("llm.model.", "model.").replace("llm.", "")
 
             # Handle LoRA weights if present
-            if "lora" in key.lower():
-                # LoRA weights: lora_A (down-projection), lora_B (up-projection)
-                # Keep structure as-is, they're typically already in correct format
-                pass
-            # Transpose linear layer weights
-            elif "weight" in key and val.ndim == 2:
+            # NeMo LoRA format: lora_A (rank, in_features), lora_B (out_features, rank)
+            # MLX expects: lora_a (in_features, rank), lora_b (rank, out_features)
+            # ONLY LoRA weights need transposition - base decoder weights are already in PyTorch format
+            if "lora" in key.lower() and "weight" in key and val.ndim == 2:
                 val = val.T
+            # Note: Base decoder weights are already in correct format (out_features, in_features)
+            # Do NOT transpose them!
 
             mlx_state[new_key] = val.contiguous()
             stats["decoder"] += 1

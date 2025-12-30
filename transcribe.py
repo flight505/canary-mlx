@@ -120,21 +120,36 @@ def extract_mel_features(
     return mx.array(log_mel.numpy())
 
 
-def format_prompt(prompt_text: str, audio_locator: str) -> str:
+def format_prompt(
+    prompt_text: str,
+    audio_locator: str,
+    language: str = "en",
+    task: str = "transcribe",
+    timestamps: bool = False
+) -> str:
     """
-    Format prompt with audio locator tag.
+    Format prompt with Canary control tokens and audio locator.
 
-    Canary expects prompts like:
-    "Transcribe the following: <|audioplaceholder|>"
+    Canary expects prompts with language and task specification:
+    "<|en|><|transcribe|><|notimestamps|> Transcribe the following: <|audioplaceholder|>"
 
     Args:
         prompt_text: Base prompt (e.g., "Transcribe the following:")
-        audio_locator: Audio locator tag
+        audio_locator: Audio locator tag (default: "<|audioplaceholder|>")
+        language: Language code (default: "en")
+        task: Task type - "transcribe" or "translate" (default: "transcribe")
+        timestamps: Whether to include timestamps (default: False)
 
     Returns:
-        Formatted prompt string
+        Formatted prompt string with Canary control tokens
     """
-    return f"{prompt_text} {audio_locator}"
+    # Canary control tokens
+    lang_token = f"<|{language}|>"
+    task_token = f"<|{task}|>"
+    time_token = "<|timestamps|>" if timestamps else "<|notimestamps|>"
+
+    # Format: <lang><task><timestamps> prompt text <audio>
+    return f"{lang_token}{task_token}{time_token} {prompt_text} {audio_locator}"
 
 
 def greedy_generate(
